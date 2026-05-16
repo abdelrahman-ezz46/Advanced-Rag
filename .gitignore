@@ -1,0 +1,18 @@
+# Virtual Environments
+venv/
+env/
+.env
+
+# Database and Index files
+chroma_db/
+bm25_index.json
+
+# Raw Data / Media
+data/
+*.mp4
+*.mp3
+*.pdf
+
+# Python Cache
+__pycache__/
+*.pyc
