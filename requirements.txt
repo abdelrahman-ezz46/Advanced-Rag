@@ -1,0 +1,19 @@
+# Web Framework
+streamlit
+
+# Local LLM Integration
+ollama
+
+# Vector Database & Retrieval
+chromadb
+rank_bm25
+
+# Document Parsing (PDFs, Word, etc.)
+docling
+
+# Video & Audio Processing
+ffmpeg-python
+openai-whisper
+
+# Miscellaneous
+pydantic
