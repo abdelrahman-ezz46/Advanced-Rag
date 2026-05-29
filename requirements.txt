@@ -8,6 +8,9 @@ ollama
 chromadb
 rank_bm25
 
+# Cross-Encoder Reranker (optional — enable with RAGConnector(use_reranker=True))
+sentence-transformers
+
 # Document Parsing (PDFs, Word, etc.)
 docling
 
