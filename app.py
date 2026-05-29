@@ -71,21 +71,27 @@ if prompt := st.chat_input("Ask a question based on your uploaded data..."):
     with st.chat_message("assistant"):
         with st.spinner("Searching documents and reasoning..."):
             try:
-                # Query the backend
-                # TODO: Implement multi-turn support via query rewriting or context injection
+                # Query the backend.
+                # Pass everything BEFORE the current question as history so the
+                # backend can rewrite follow-ups into standalone search queries.
                 results = st.session_state.rag.query(
                     question=prompt,
                     top_k=5,
+                    chat_history=st.session_state.messages[:-1],
                 )
                 answer = results["answer"]
                 sources = results["sources"]
-                
+
                 # Render the answer
                 st.markdown(answer)
-                
+
                 # Render the sources in an expander
                 if sources:
                     with st.expander("📚 View Sources used for this answer"):
+                        # If the question was rewritten for retrieval, show it.
+                        search_query = results.get("search_query", prompt)
+                        if search_query != prompt:
+                            st.caption(f"🔄 **Rewritten query:** _{search_query}_")
                         for i, src in enumerate(sources, 1):
                             meta = src.get("metadata", {})
                             source_name = meta.get('source', 'Unknown File')
