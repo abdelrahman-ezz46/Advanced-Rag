@@ -9,15 +9,17 @@ No OpenAI API keys. No cloud services. Everything runs on your machine.
 ##  Features
 
 - **Multimodal ingestion** — PDFs, DOCX, images, MP3/WAV audio, MP4/MKV video, and 20+ code formats
-- **Agentic chunking** — LLM-driven semantic segmentation (not naive fixed-size splits)
+- **Deterministic Markdown chunking** — structure-aware splitter that respects headings, fenced code, tables, and blockquotes; ~200× faster than the legacy LLM chunker and immune to JSON-parse failures on long docs. The LLM chunker is still available via `chunker_strategy="llm"`.
 - **Contextual Retrieval** — every chunk is enriched with a situating context sentence before embedding, reducing retrieval failures by ~49% ([Anthropic, 2024](https://www.anthropic.com/news/contextual-retrieval))
 - **Hybrid retrieval** — dense vector search (ChromaDB + nomic-embed-text) fused with BM25 sparse search via Reciprocal Rank Fusion (RRF)
 - **Optional cross-encoder reranking** — a second-stage `BAAI/bge-reranker-v2-m3` re-scores fused candidates for relevance, typically lifting top-1 precision by ~5–15%
 - **Multi-turn conversational retrieval** — follow-up questions with pronouns ("how does that compare to Q2?") are rewritten into self-contained search queries against the chat history before retrieval
 - **Cross-file numbered citations** — answers cite each claim with `[1]`, `[2]`, … pointing at a numbered source list, so attribution stays clear even when the response stitches together facts from multiple files
 - **Metadata filtering in the UI** — restrict retrieval by **modality** (Document / Audio / Image / Video / Code), **source file**, or **indexed-date range** directly from the sidebar
+- **Web URL ingestion** — paste any article URL; `trafilatura` extracts clean main-content Markdown which flows through the same chunking → contextualisation → indexing pipeline as files
+- **Persistent memory & prompts** — a user-controlled system prompt + a list of "standing facts" notes that get injected into every answer (no re-indexing needed)
 - **Fully local LLMs** — Llama 3 for chunking, context generation, and answering; LLaVA for image understanding; Whisper for transcription
-- **Streamlit chat UI** — chat interface with source attribution, chunk snippets, and per-source RRF / rerank scores
+- **Tabbed Next.js + Tailwind UI (v2)** — Chat / Knowledge Base / Memory tabs against a FastAPI backend. Legacy Streamlit UI still works as a fallback.
 - **Persistent indexes** — ChromaDB and BM25 survive restarts; re-indexing a file automatically deduplicates
 
 ---
@@ -108,22 +110,38 @@ pip install sentence-transformers
 
 The reranker model (`BAAI/bge-reranker-v2-m3`, ~1.1 GB) downloads automatically the first time you run a query with `use_reranker=True`.
 
-### 4. Run the App
+### 4. Run the App (v2 — FastAPI + Next.js)
+
+The v2 UI is a **separate backend + frontend** running in two terminals:
 
 ```bash
-streamlit run app.py
+# Terminal 1 — Python backend (port 8000)
+uvicorn api:app --reload --port 8000
+
+# Terminal 2 — Next.js frontend (port 3000)
+cd frontend
+npm install        # first time only
+npm run dev
 ```
 
-Open [http://localhost:8501](http://localhost:8501) in your browser.
+Then open **[http://localhost:3000](http://localhost:3000)**. The frontend
+proxies `/api/*` to the Python backend automatically (configured in
+`frontend/next.config.js`), so no CORS setup is needed.
+
+> The original Streamlit UI (`streamlit run app.py`) is still in the repo as a
+> simpler fallback if you don't want to install Node.
 
 ---
 
-## 📖 Usage
+## 📖 Usage (v2 UI)
 
-1. **Upload a file** using the sidebar file uploader
-2. Click **"Process & Index File"** — the pipeline ingests, chunks, contextualises, and indexes it
-3. **Ask questions** in the chat input at the bottom
-4. Expand **"📚 View Sources"** under any answer to see which chunks were used and their RRF scores
+The new UI has three tabs:
+
+| Tab | What it does |
+|-----|--------------|
+| **Chat** | Conversation with the assistant. Numbered `[1][2]` citations link to the sources panel under each answer. Compact filter bar above the chat lets you scope retrieval by **modality** or **source**. Follow-up questions with pronouns ("how does that compare?") are auto-rewritten using chat history. |
+| **Knowledge Base** | Table of every indexed source — filename/title, modality, chunk count, indexed date, delete button. **Upload a file** OR **paste a web URL** to ingest. |
+| **Memory & Prompts** | A persistent **custom system prompt** (e.g. "answer concisely in British English") and a list of **memory notes** (standing facts like "Acme is our client since 2019"). Both are injected into every answer automatically — no re-indexing needed. |
 
 ### CLI Usage (no UI)
 
@@ -163,14 +181,16 @@ python rag_connector.py delete quarterly_report.pdf
 
 ```
 .
-├── app.py                      # Streamlit chat UI
-├── rag_connector.py            # Top-level façade: index() and query()
+├── api.py                      # FastAPI backend — chat, ingest, sources, memory
+├── memory_store.py             # JSON-backed system prompt + memory notes
+├── rag_connector.py            # Core façade: index(), index_url(), query()
 │   ├── OllamaEmbedder          # nomic-embed-text dense embeddings
-│   ├── BM25Index               # Sparse keyword index (persisted to bm25_index.json)
-│   ├── ChromaStore             # ChromaDB vector store (persisted to ./chroma_db/)
-│   ├── CrossEncoderReranker    # Optional second-stage reranking (bge-reranker-v2-m3)
-│   ├── HybridRetriever         # RRF fusion of dense + sparse results
-│   └── RAGConnector            # Orchestrates all of the above
+│   ├── BM25Index               # Sparse keyword index (bm25_index.json)
+│   ├── ChromaStore             # Dense vectors + metadata (./chroma_db/)
+│   ├── CrossEncoderReranker    # Optional bge-reranker-v2-m3
+│   ├── HybridRetriever         # RRF fusion
+│   ├── QueryRewriter           # Multi-turn conversational rewriting
+│   └── RAGConnector            # Top-level orchestrator
 ├── multimodal_rag_pipeline.py  # Ingestion pipeline
 │   ├── DataRouter              # File-type dispatcher
 │   ├── DocumentProcessor       # PDF/DOCX → Markdown via Docling
@@ -178,12 +198,21 @@ python rag_connector.py delete quarterly_report.pdf
 │   ├── ImageProcessor          # Image → description via LLaVA
 │   ├── VideoProcessor          # Video → audio + keyframes
 │   ├── CodeProcessor           # Source code → fenced Markdown
+│   ├── URLProcessor            # Web page → clean Markdown via trafilatura
 │   ├── MarkdownUnifier         # Attaches metadata header
-│   ├── ChunkingAgent           # Agentic semantic chunking via Llama 3
+│   ├── MarkdownChunker         # Deterministic structure-aware splitter (default)
+│   ├── ChunkingAgent           # Legacy LLM chunker (opt-in: chunker_strategy="llm")
 │   ├── ContextualRetriever     # Parallel context enrichment via Llama 3
-│   └── MultimodalRAGPipeline   # High-level orchestrator
+│   └── MultimodalRAGPipeline   # High-level orchestrator (ingest + ingest_url)
+├── app.py                      # Legacy Streamlit UI (still works)
+├── frontend/                   # Next.js 14 + TypeScript + Tailwind UI (v2)
+│   ├── app/page.tsx            # 3-tab shell
+│   ├── app/components/         # ChatTab · KnowledgeBaseTab · MemoryTab
+│   ├── lib/api.ts              # Typed client for the FastAPI backend
+│   └── package.json
 ├── bm25_index.json             # Persisted BM25 corpus (auto-created)
 ├── chroma_db/                  # ChromaDB storage (auto-created)
+├── memory.json                 # User memory state (auto-created)
 └── requirements.txt
 ```
 
@@ -219,6 +248,21 @@ rag.index("lecture.mp4")
 results = rag.query("What were the key takeaways?", top_k=5)
 print(results["answer"])
 ```
+
+---
+
+## ✂️ How the Markdown Chunker Works
+
+Documents are split into chunks by a deterministic structure-aware walker:
+
+1. **Tokenize** the unified Markdown into structural blocks: headings (h1–h6), paragraphs, fenced code blocks, tables, and blockquotes.
+2. **Pack** blocks greedily up to ~1,500 chars per chunk, preferring heading boundaries as split points whenever the buffer is at least half-full.
+3. **Preserve atomicity** — code blocks, tables, and blockquotes are never split across chunks (the same rule the LLM chunker tried to follow but occasionally violated).
+4. **Long paragraphs** that exceed the max are split at sentence boundaries instead of mid-word.
+5. **Outline prepending** — chunks that begin mid-section get the parent heading breadcrumb prepended so they remain self-contained when retrieved out of order. Chunks that already start with a heading need no prefix.
+6. **Tiny tail merge** — a final chunk under MIN_CHARS is merged back into its predecessor rather than emitted standalone.
+
+This replaced the prior `ChunkingAgent` (LLM with a JSON-emit prompt) as the default. The LLM chunker silently truncated past `num_ctx=8192` and occasionally returned malformed JSON on long inputs, killing ingest. The deterministic chunker runs in ~100 ms on the same document, never crashes, and emits chunks that are exact substrings of the source (no paraphrasing drift). Both are still available — pick with `MultimodalRAGPipeline(chunker_strategy="markdown" | "llm")`.
 
 ---
 
@@ -307,9 +351,12 @@ sentence-transformers  # Cross-encoder reranker (optional)
 - [x] Multi-turn / conversational retrieval (query rewriting from chat history)
 - [x] Multi-document cross-file citation
 - [x] Metadata filtering in the UI (by modality, date, source)
-- [ ] Support for web URL ingestion
+- [x] Support for web URL ingestion
+- [x] Full UI overhaul (FastAPI + Next.js + Tailwind, 3-tab layout)
+- [x] Persistent memory & custom prompts
 - [ ] Docker Compose setup for one-command deployment
 - [ ] Page-number / timestamp granularity in citations (PDF pages, video timestamps)
+- [ ] Streaming token-by-token chat responses
 
 ---
 

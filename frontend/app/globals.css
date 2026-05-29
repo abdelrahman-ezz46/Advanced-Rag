@@ -1,0 +1,46 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  background: #0b0d12;
+  color: #e6e8ee;
+  height: 100%;
+}
+
+/* Markdown body inside the chat bubbles */
+.prose-chat p { margin: 0.25rem 0; line-height: 1.55; }
+.prose-chat ul, .prose-chat ol { margin: 0.4rem 0 0.4rem 1.25rem; }
+.prose-chat code {
+  background: #1a1f2b;
+  padding: 0.05rem 0.3rem;
+  border-radius: 3px;
+  font-size: 0.86em;
+}
+.prose-chat pre {
+  background: #1a1f2b;
+  padding: 0.7rem 0.9rem;
+  border-radius: 6px;
+  overflow-x: auto;
+  font-size: 0.86em;
+  border: 1px solid #262c3a;
+}
+.prose-chat a { color: #4a9eed; text-decoration: underline; }
+.prose-chat h1, .prose-chat h2, .prose-chat h3 {
+  margin: 0.6rem 0 0.3rem; font-weight: 600;
+}
+
+/* Custom scrollbars for a more app-like feel */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: #262c3a;
+  border-radius: 8px;
+  border: 2px solid #0b0d12;
+}
+::-webkit-scrollbar-thumb:hover { background: #364056; }

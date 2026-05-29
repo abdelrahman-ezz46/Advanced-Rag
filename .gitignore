@@ -6,6 +6,12 @@ env/
 # Database and Index files
 chroma_db/
 bm25_index.json
+memory.json
+
+# Frontend build artefacts (the frontend/ source IS tracked)
+frontend/node_modules/
+frontend/.next/
+frontend/out/
 
 # Raw Data / Media
 data/

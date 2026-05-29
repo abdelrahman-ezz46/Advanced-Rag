@@ -1062,42 +1062,73 @@ provided source chunks. Follow these rules:
             logger.warning("[RAGConnector] Pipeline returned 0 chunks for '%s'.", path.name)
             return 0
 
-        # Attach source filename and ingestion timestamps to each chunk.
+        return self._store_chunks(chunks, source_name=path.name, id_prefix=path.stem)
+
+    def index_url(self, url: str, delete_existing: bool = True) -> dict:
+        """
+        Fetch a web page, ingest it, and store its chunks.
+
+        Returns
+        -------
+        dict: {"source": <page title>, "chunks": <int>}
+        """
+        logger.info("═══ [RAGConnector] Indexing URL '%s' ═══", url)
+
+        # Run the URL pipeline first so we know the resolved source name (title).
+        chunks, source_name = self._pipeline.ingest_url(url)
+        if not chunks:
+            logger.warning("[RAGConnector] URL pipeline returned 0 chunks for '%s'.", url)
+            return {"source": source_name, "chunks": 0}
+
+        # Re-index cleanly: drop any prior chunks from the same source.
+        if delete_existing:
+            self._chroma.delete_by_source(source_name)
+            self._bm25.delete_by_source(source_name)
+
+        n = self._store_chunks(
+            chunks, source_name=source_name, id_prefix=self._slugify(source_name)
+        )
+        return {"source": source_name, "chunks": n}
+
+    @staticmethod
+    def _slugify(text: str) -> str:
+        """Make a filesystem/ID-safe prefix from arbitrary text."""
+        slug = re.sub(r"[^a-zA-Z0-9]+", "-", text).strip("-").lower()
+        return slug[:50] or "web"
+
+    def _store_chunks(
+        self,
+        chunks    : list[dict],
+        source_name: str,
+        id_prefix : str,
+    ) -> int:
+        """
+        Shared storage path for both file and URL ingestion:
+        stamp timestamps → embed → upsert to ChromaDB → add to BM25.
+        """
+        # Attach source name and ingestion timestamps to each chunk.
         # indexed_at (ISO) is for display; indexed_ts (Unix int) is what the
         # UI date-range filter uses with ChromaDB's $gte/$lte operators.
-        now    = datetime.now(tz=timezone.utc)
-        iso_ts = now.isoformat(timespec="seconds")
+        now     = datetime.now(tz=timezone.utc)
+        iso_ts  = now.isoformat(timespec="seconds")
         unix_ts = int(now.timestamp())
         for chunk in chunks:
-            chunk.setdefault("source", path.name)
+            chunk.setdefault("source", source_name)
             chunk["indexed_at"] = iso_ts
             chunk["indexed_ts"] = unix_ts
 
-        # ── Step 3: Embed all contextualized_text strings ─────────────────
         logger.info("[RAGConnector] Embedding %d chunks…", len(chunks))
-
         texts_to_embed = [
-            # Prefer contextualized_text (context + chunk); fall back to chunk_text
             chunk.get("contextualized_text") or chunk.get("chunk_text", "")
             for chunk in chunks
         ]
         embeddings = self._embedder.embed_batch(texts_to_embed)
 
-        # ── Step 4: Generate stable unique IDs ────────────────────────────
-        # Format: source_filename::chunk_index  (deterministic for dedup)
-        doc_ids = [
-            f"{path.stem}::{i:04d}"
-            for i in range(len(chunks))
-        ]
+        # Stable, deterministic IDs: <prefix>::<index>
+        doc_ids = [f"{id_prefix}::{i:04d}" for i in range(len(chunks))]
 
-        # ── Step 5: Batch upsert into ChromaDB ────────────────────────────
-        self._chroma.upsert_batch(
-            doc_ids   =doc_ids,
-            embeddings=embeddings,
-            chunks    =chunks,
-        )
+        self._chroma.upsert_batch(doc_ids=doc_ids, embeddings=embeddings, chunks=chunks)
 
-        # ── Step 6: Batch add to BM25 ─────────────────────────────────────
         bm25_docs = [
             (doc_id, chunk.get("contextualized_text") or chunk.get("chunk_text", ""))
             for doc_id, chunk in zip(doc_ids, chunks)
@@ -1106,8 +1137,7 @@ provided source chunks. Follow these rules:
 
         logger.info(
             "═══ [RAGConnector] Indexed '%s' → %d chunks stored ═══",
-            path.name,
-            len(chunks),
+            source_name, len(chunks),
         )
         return len(chunks)
 
@@ -1164,6 +1194,8 @@ provided source chunks. Follow these rules:
         date_from_ts    : int | None = None,
         date_to_ts      : int | None = None,
         chat_history    : list[dict] | None = None,
+        extra_system    : str | None = None,
+        memory_notes    : list[str] | None = None,
     ) -> dict:
         """
         Retrieve relevant chunks and generate an answer.
@@ -1269,7 +1301,12 @@ provided source chunks. Follow these rules:
 
         # ── Step 6: Generate answer via llama3 ───────────────────────────
         # Answer the user's ORIGINAL phrasing, with recent history for coherence.
-        answer = self._generate(question, fused, chat_history=chat_history)
+        answer = self._generate(
+            question, fused,
+            chat_history=chat_history,
+            extra_system=extra_system,
+            memory_notes=memory_notes,
+        )
 
         return {
             "answer"      : answer,
@@ -1285,13 +1322,17 @@ provided source chunks. Follow these rules:
         question: str,
         chunks: list[dict],
         chat_history: list[dict] | None = None,
+        extra_system: str | None = None,
+        memory_notes: list[str] | None = None,
     ) -> str:
         """
         Build a grounded prompt from retrieved chunks and call llama3 to
         generate a final answer.
 
         The prompt structure follows the RAG pattern:
-          SYSTEM:    instructions + grounding rules
+          SYSTEM:    base instructions + grounding rules
+                     + user's custom system prompt (optional)
+                     + persistent memory notes (optional)
           HISTORY:   recent prior turns (optional, for conversational coherence)
           USER:      retrieved context + question
         """
@@ -1317,11 +1358,27 @@ provided source chunks. Follow these rules:
             f"Answer (cite each claim with [N] matching the chunk numbers above):"
         )
 
+        # Build the system prompt: base rules + user customisations + memory.
+        # Memory notes are listed as standing facts the model should respect
+        # without treating them as retrievable source citations.
+        system_parts = [self.GENERATION_SYSTEM_PROMPT]
+        if extra_system and extra_system.strip():
+            system_parts.append("ADDITIONAL USER INSTRUCTIONS:\n" + extra_system.strip())
+        if memory_notes:
+            cleaned = [n.strip() for n in memory_notes if n and n.strip()]
+            if cleaned:
+                bullet_list = "\n".join(f"- {n}" for n in cleaned)
+                system_parts.append(
+                    "USER MEMORY (standing facts to respect — do NOT cite these as [N] "
+                    "since they're not source chunks):\n" + bullet_list
+                )
+        system_prompt = "\n\n".join(system_parts)
+
         # Assemble the message list: system prompt, recent history, then the
         # grounded user turn. History gives the model conversational context
         # while the source chunks keep the answer grounded.
         messages: list[dict] = [
-            {"role": "system", "content": self.GENERATION_SYSTEM_PROMPT}
+            {"role": "system", "content": system_prompt}
         ]
         if chat_history:
             for m in chat_history[-self.HISTORY_TURNS_IN_PROMPT:]:
@@ -1365,6 +1422,33 @@ provided source chunks. Follow these rules:
     def list_modalities(self) -> list[str]:
         """Return all distinct modalities in the index (for UI filters)."""
         return self._chroma.list_distinct("modality")
+
+    def list_sources_detailed(self) -> list[dict]:
+        """
+        Per-source aggregates for the Knowledge Base tab.
+
+        Returns a list of dicts:
+            {"source": str, "modality": str, "chunks": int, "indexed_at": str}
+
+        Sorted by indexed_at descending (newest first). Single pass over Chroma
+        metadata — fine for indexes up to ~10⁵ chunks.
+        """
+        result = self._chroma._collection.get(include=["metadatas"])  # type: ignore[attr-defined]
+        agg: dict[str, dict] = {}
+        for meta in result.get("metadatas", []) or []:
+            src = meta.get("source") or "(unknown)"
+            entry = agg.setdefault(src, {
+                "source"    : src,
+                "modality"  : meta.get("modality", ""),
+                "chunks"    : 0,
+                "indexed_at": meta.get("indexed_at", ""),
+            })
+            entry["chunks"] += 1
+            # Keep the most recent indexed_at if the source was re-ingested.
+            ts = meta.get("indexed_at", "")
+            if ts and ts > entry["indexed_at"]:
+                entry["indexed_at"] = ts
+        return sorted(agg.values(), key=lambda r: r["indexed_at"], reverse=True)
 
     def delete_source(self, source_filename: str) -> dict:
         """Remove all chunks from a specific source file."""

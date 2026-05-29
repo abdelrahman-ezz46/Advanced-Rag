@@ -1,6 +1,9 @@
 # Web Framework
-# Used for the chat UI and the sidebar metadata-filter widgets
-# (multiselect for modality/source, date_input for indexed-date range).
+# FastAPI now powers the backend; the React/Next frontend lives in ./frontend
+# and talks to this server over JSON. Streamlit is kept as a legacy/fallback UI.
+fastapi
+uvicorn[standard]
+python-multipart
 streamlit
 
 # Local LLM Integration
@@ -17,6 +20,11 @@ rank_bm25
 
 # Cross-Encoder Reranker (optional — enable with RAGConnector(use_reranker=True))
 sentence-transformers
+
+# Web URL Ingestion
+# httpx fetches pages; trafilatura strips boilerplate and returns clean Markdown.
+httpx
+trafilatura
 
 # Document Parsing (PDFs, Word, etc.)
 docling
