@@ -543,7 +543,135 @@ class ChromaStore:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  4. HYBRID RETRIEVER  (Reciprocal Rank Fusion)
+#  4. CROSS-ENCODER RERANKER  (Second-stage precision)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class CrossEncoderReranker:
+    """
+    Reranks retrieved candidates using a cross-encoder model that jointly
+    encodes (query, candidate) pairs to judge relevance.
+
+    WHY RERANKING?
+    ──────────────
+    RRF fusion ranks by position alone — it doesn't actually measure relevance.
+    A cross-encoder scores query–chunk pairs end-to-end, catching false positives
+    that RRF sometimes promotes.
+
+    EXAMPLE IMPROVEMENT
+    ───────────────────
+    Query: "What caused the revenue decline?"
+    RRF rank 1: "Revenue declined by 12%"         ← mentions revenue, high RRF score
+    RRF rank 2: "Revenue drivers: market size"    ← answers the Q, lower RRF score
+
+    Cross-encoder reranks to:
+    1. "Revenue drivers: market size"              ← actual cause
+    2. "Revenue declined by 12%"                   ← just the fact
+
+    The model **bge-reranker-v2-m3** (from BAAI) runs locally via sentence-transformers
+    and is optimized for this task. Adds ~5–10ms per pair, negligible for top-k reranking.
+
+    Install : pip install sentence-transformers
+    Model   : bge-reranker-v2-m3 (auto-downloads ~1.1 GB on first run)
+
+    Cost trade-off
+    ──────────────
+    • Speed: +100–300ms for reranking 20 candidates (acceptable for search)
+    • Quality: ~5–15% improvement in top-1 relevance (measured on MTEB benchmarks)
+    • Simplicity: Drop-in after RRF; no changes to ingestion
+    """
+
+    DEFAULT_MODEL = "BAAI/bge-reranker-v2-m3"
+
+    def __init__(self, model: str = DEFAULT_MODEL) -> None:
+        self._model_name = model
+        self._model: Any = None  # lazy-loaded
+
+    def _load_model(self) -> Any:
+        """Load and cache the cross-encoder model."""
+        if self._model is None:
+            try:
+                from sentence_transformers import CrossEncoder  # type: ignore
+            except ImportError as exc:
+                raise RuntimeError(
+                    "sentence-transformers not installed. Run: pip install sentence-transformers"
+                ) from exc
+
+            logger.info(
+                "[CrossEncoderReranker] Loading %s (first run downloads model)…",
+                self._model_name,
+            )
+            self._model = CrossEncoder(self._model_name, max_length=512)
+            logger.info("[CrossEncoderReranker] Model loaded.")
+
+        return self._model
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[dict],
+        top_k: int = 5,
+    ) -> list[dict]:
+        """
+        Rerank candidates by relevance to the query.
+
+        Parameters
+        ----------
+        query : str
+            The search query.
+        candidates : list[dict]
+            Retrieved chunks from RRF. Each must have a "document" key.
+        top_k : int
+            How many reranked results to return.
+
+        Returns
+        -------
+        list[dict]
+            Top-k candidates sorted by cross-encoder score.
+            Adds "rerank_score" to each dict.
+        """
+        if not candidates:
+            return candidates
+
+        model = self._load_model()
+
+        # Prepare pairs: (query, candidate_text) for the model
+        pairs = [
+            [query, cand.get("document", "")]
+            for cand in candidates
+        ]
+
+        logger.debug("[CrossEncoderReranker] Scoring %d pairs…", len(pairs))
+
+        try:
+            # Scores are typically in range [0, 1] (higher = more relevant)
+            scores = model.predict(pairs)
+        except Exception as exc:
+            logger.error("[CrossEncoderReranker] Scoring failed: %s", exc)
+            # Degrade gracefully: return original order
+            return candidates[:top_k]
+
+        # Attach scores and sort by descending relevance
+        scored = [
+            {**cand, "rerank_score": float(score)}
+            for cand, score in zip(candidates, scores)
+        ]
+        ranked = sorted(scored, key=lambda x: x["rerank_score"], reverse=True)[:top_k]
+
+        logger.info(
+            "[CrossEncoderReranker] Top rerank score: %.3f | Bottom: %.3f",
+            ranked[0]["rerank_score"],
+            ranked[-1]["rerank_score"],
+        )
+
+        # Update rank field to reflect new order
+        for i, item in enumerate(ranked, 1):
+            item["rank"] = i
+
+        return ranked
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  5. HYBRID RETRIEVER  (Reciprocal Rank Fusion)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class HybridRetriever:
@@ -575,6 +703,7 @@ class HybridRetriever:
         dense_results : list[dict],
         sparse_results: list[dict],
         top_k         : int = 5,
+        chroma_store  : 'ChromaStore | None' = None,
     ) -> list[dict]:
         """
         Combine dense and sparse result lists into a single ranked list.
@@ -584,6 +713,9 @@ class HybridRetriever:
         dense_results  : list[dict]   Output of ChromaStore.query()
         sparse_results : list[dict]   Output of BM25Index.query()
         top_k          : int          How many fused results to return.
+        chroma_store   : ChromaStore  Reference to ChromaDB store to fetch
+                                      sparse-only hits. If None, sparse-only
+                                      results will have empty document/metadata.
 
         Returns
         -------
@@ -612,6 +744,15 @@ class HybridRetriever:
         # Sort by RRF score descending
         sorted_ids = sorted(scores, key=lambda x: scores[x], reverse=True)[:top_k]
 
+        # For sparse-only results (not in dense lookup), fetch from ChromaDB to avoid
+        # passing blank documents to the LLM. This preserves the hybrid retrieval benefit.
+        missing_ids = [doc_id for doc_id in sorted_ids if doc_id not in chroma_lookup]
+        if missing_ids and chroma_store:
+            for doc_id in missing_ids:
+                doc = chroma_store.get_by_id(doc_id)
+                if doc:
+                    chroma_lookup[doc_id] = doc
+
         # Build output — enrich with metadata from ChromaDB where available
         output = []
         for final_rank, doc_id in enumerate(sorted_ids, 1):
@@ -633,7 +774,7 @@ class HybridRetriever:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  5. RAG CONNECTOR  (top-level façade)
+#  6. RAG CONNECTOR  (top-level façade)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class RAGConnector:
@@ -683,6 +824,9 @@ provided source chunks. Follow these rules:
         chroma_persist_dir  : str  = ChromaStore.DEFAULT_PERSIST_DIR,
         # BM25
         bm25_persist_path   : str  = "bm25_index.json",
+        # Reranking (optional)
+        use_reranker        : bool = False,
+        reranker_model      : str  = CrossEncoderReranker.DEFAULT_MODEL,
         # Generation
         generation_model    : str  = GENERATION_MODEL,
     ) -> None:
@@ -707,12 +851,18 @@ provided source chunks. Follow these rules:
         )
         self._bm25       = BM25Index(persist_path=bm25_persist_path)
         self._retriever  = HybridRetriever()
+        self._reranker   = (
+            CrossEncoderReranker(model=reranker_model)
+            if use_reranker
+            else None
+        )
         self._gen_model  = generation_model
 
         logger.info(
-            "[RAGConnector] Ready. ChromaDB: %d docs | BM25: %d docs",
+            "[RAGConnector] Ready. ChromaDB: %d docs | BM25: %d docs | Reranker: %s",
             self._chroma.count,
             self._bm25.count,
+            "enabled" if self._reranker else "disabled",
         )
 
     # ── INDEXING ──────────────────────────────────────────────────────────────
@@ -853,17 +1003,23 @@ provided source chunks. Follow these rules:
         fused = self._retriever.fuse(
             dense_results =dense_results,
             sparse_results=sparse_results,
-            top_k=top_k,
+            top_k=top_k * 2,  # over-retrieve for reranking
+            chroma_store=self._chroma,
         )
 
+        # ── Step 5: Optional reranking (cross-encoder) ─────────────────────
+        if self._reranker:
+            fused = self._reranker.rerank(question, fused, top_k=top_k)
+
         logger.info(
-            "[RAGConnector] Retrieval: %d dense | %d sparse | %d fused",
+            "[RAGConnector] Retrieval: %d dense | %d sparse | %d fused" +
+            (" | reranked" if self._reranker else ""),
             len(dense_results),
             len(sparse_results),
             len(fused),
         )
 
-        # ── Step 5: Generate answer via llama3 ───────────────────────────
+        # ── Step 6: Generate answer via llama3 ───────────────────────────
         answer = self._generate(question, fused)
 
         return {

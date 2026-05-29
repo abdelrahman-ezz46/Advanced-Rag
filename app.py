@@ -72,11 +72,11 @@ if prompt := st.chat_input("Ask a question based on your uploaded data..."):
         with st.spinner("Searching documents and reasoning..."):
             try:
                 # Query the backend
+                # TODO: Implement multi-turn support via query rewriting or context injection
                 results = st.session_state.rag.query(
-                question=prompt, 
-                top_k=5, 
-                chat_history=st.session_state.messages 
-)
+                    question=prompt,
+                    top_k=5,
+                )
                 answer = results["answer"]
                 sources = results["sources"]
                 
